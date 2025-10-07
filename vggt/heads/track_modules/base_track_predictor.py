@@ -4,6 +4,10 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
+import os
+import re
+from typing import List, Optional, Sequence, Tuple
+
 import torch
 import torch.nn as nn
 from einops import rearrange, repeat
@@ -12,6 +16,123 @@ from einops import rearrange, repeat
 from .blocks import EfficientUpdateFormer, CorrBlock
 from .utils import sample_features4d, get_2d_embedding, get_2d_sincos_pos_embed
 from .modules import Mlp
+
+
+def _to_batch_lists(
+    values: Optional[Sequence], batch_size: int
+) -> Optional[List[List[int]]]:
+    """Convert possible tensor/list inputs into per-batch Python lists."""
+
+    if values is None:
+        return None
+
+    if isinstance(values, torch.Tensor):
+        if values.dim() == 1:
+            return [values.cpu().tolist()]
+        if values.dim() == 2:
+            return [row.cpu().tolist() for row in values]
+        return None
+
+    if isinstance(values, (list, tuple)):
+        if len(values) == batch_size and values and isinstance(values[0], (list, tuple, torch.Tensor)):
+            batch_values: List[List[int]] = []
+            for item in values:
+                if isinstance(item, torch.Tensor):
+                    batch_values.append(item.cpu().tolist())
+                else:
+                    batch_values.append(list(item))
+            return batch_values
+        if batch_size == 1 and values and isinstance(values[0], (int, float)):
+            return [list(values)]
+
+    return None
+
+
+def _parse_names_to_indices(
+    frame_names: Sequence[Sequence[str]],
+) -> Optional[Tuple[List[List[int]], List[List[int]]]]:
+    """Parse timestamps and view indices from filename batches."""
+
+    pattern = re.compile(r"^(?P<prefix>.+?)_(?P<time>\d+)_cam(?P<view>\d+)\.[^.]+$")
+    time_batches: List[List[int]] = []
+    view_batches: List[List[int]] = []
+
+    for names in frame_names:
+        current_times: List[int] = []
+        current_views: List[int] = []
+        for name in names:
+            filename = os.path.basename(name)
+            match = pattern.match(filename)
+            if match is None:
+                return None
+            current_times.append(int(match.group("time")))
+            current_views.append(int(match.group("view")))
+        time_batches.append(current_times)
+        view_batches.append(current_views)
+
+    return time_batches, view_batches
+
+
+def _build_time_view_mask(times: Sequence[int], views: Sequence[int]) -> torch.Tensor:
+    """Create a boolean attention mask enforcing adjacency constraints."""
+
+    length = len(times)
+    allowed = torch.zeros(length, length, dtype=torch.bool)
+
+    time_to_view_idx: dict[int, dict[int, int]] = {}
+    time_to_sorted_views: dict[int, List[int]] = {}
+
+    for idx, (time_val, view_val) in enumerate(zip(times, views)):
+        time_to_view_idx.setdefault(time_val, {})[view_val] = idx
+
+    for time_val, view_map in time_to_view_idx.items():
+        time_to_sorted_views[time_val] = sorted(view_map.keys())
+
+    for idx, (time_val, view_val) in enumerate(zip(times, views)):
+        neighbor_views: List[int] = []
+        sorted_views = time_to_sorted_views[time_val]
+        if not sorted_views:
+            continue
+
+        view_pos = sorted_views.index(view_val)
+        num_views = len(sorted_views)
+        neighbor_views.append(sorted_views[view_pos])
+        if num_views > 1:
+            neighbor_views.append(sorted_views[(view_pos - 1) % num_views])
+            neighbor_views.append(sorted_views[(view_pos + 1) % num_views])
+
+        for offset in (-1, 1):
+            neighbor_time = time_val + offset
+            candidate_map = time_to_view_idx.get(neighbor_time)
+            if not candidate_map:
+                continue
+            for neighbor_view in neighbor_views:
+                neighbor_idx = candidate_map.get(neighbor_view)
+                if neighbor_idx is not None:
+                    allowed[idx, neighbor_idx] = True
+                    allowed[neighbor_idx, idx] = True
+
+    if allowed.numel() > 0:
+        row_has_edge = allowed.any(dim=1)
+        missing_indices = torch.nonzero(~row_has_edge, as_tuple=True)[0]
+        if missing_indices.numel() > 0:
+            allowed[missing_indices, missing_indices] = True
+
+    return ~allowed
+
+
+def _build_batch_time_view_mask(
+    times: List[List[int]],
+    views: List[List[int]],
+    device: torch.device,
+) -> torch.Tensor:
+    """Stack per-sample masks into a tensor of shape (B, S, S)."""
+
+    masks = [
+        _build_time_view_mask(sample_times, sample_views)
+        for sample_times, sample_views in zip(times, views)
+    ]
+    return torch.stack(masks, dim=0).to(device)
 
 
 class BaseTrackerPredictor(nn.Module):
@@ -79,7 +200,18 @@ class BaseTrackerPredictor(nn.Module):
         if predict_conf:
             self.conf_predictor = nn.Sequential(nn.Linear(self.latent_dim, 1))
 
-    def forward(self, query_points, fmaps=None, iters=6, return_feat=False, down_ratio=1, apply_sigmoid=True):
+    def forward(
+        self,
+        query_points,
+        fmaps=None,
+        iters=6,
+        return_feat=False,
+        down_ratio=1,
+        apply_sigmoid=True,
+        frame_time_indices=None,
+        frame_view_indices=None,
+        frame_names=None,
+    ):
         """
         query_points: B x N x 2, the number of batches, tracks, and xy
         fmaps: B x S x C x HH x WW, the number of batches, frames, and feature dimension.
@@ -116,6 +248,21 @@ class BaseTrackerPredictor(nn.Module):
         coords_backup = coords.clone()
 
         fcorr_fn = CorrBlock(fmaps, num_levels=self.corr_levels, radius=self.corr_radius)
+
+        time_lists = _to_batch_lists(frame_time_indices, B)
+        view_lists = _to_batch_lists(frame_view_indices, B)
+
+        if (time_lists is None or view_lists is None) and frame_names is not None:
+            name_lists = frame_names
+            if isinstance(name_lists, (list, tuple)) and name_lists and isinstance(name_lists[0], str):
+                name_lists = [name_lists]
+            parsed = _parse_names_to_indices(name_lists) if name_lists is not None else None
+            if parsed is not None:
+                time_lists, view_lists = parsed
+
+        time_attn_mask = None
+        if time_lists is not None and view_lists is not None:
+            time_attn_mask = _build_batch_time_view_mask(time_lists, view_lists, device=query_points.device)
 
         coord_preds = []
 
@@ -163,7 +310,7 @@ class BaseTrackerPredictor(nn.Module):
             x = rearrange(x, "(b n) s d -> b n s d", b=B)
 
             # Compute the delta coordinates and delta track features
-            delta, _ = self.updateformer(x)
+            delta, _ = self.updateformer(x, mask={"time": time_attn_mask} if time_attn_mask is not None else None)
 
             # BN, S, C
             delta = rearrange(delta, " b n s d -> (b n) s d", b=B)

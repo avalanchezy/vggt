@@ -96,17 +96,41 @@ class EfficientUpdateFormer(nn.Module):
 
         B, _, T, _ = tokens.shape
 
+        time_mask = None
+        space_mask = None
+        if mask is not None:
+            if isinstance(mask, dict):
+                time_mask = mask.get("time")
+                space_mask = mask.get("space")
+            else:
+                time_mask = mask
+
+        expanded_time_mask = None
+
         if self.add_space_attn:
             virtual_tokens = self.virual_tracks.repeat(B, 1, T, 1)
             tokens = torch.cat([tokens, virtual_tokens], dim=1)
 
         _, N, _, _ = tokens.shape
 
+        if time_mask is not None:
+            if time_mask.dim() == 3:
+                expanded_time_mask = (
+                    time_mask.unsqueeze(1)
+                    .expand(-1, N, -1, -1)
+                    .reshape(-1, T, T)
+                    .contiguous()
+                )
+            elif time_mask.dim() == 4:
+                expanded_time_mask = time_mask.reshape(-1, T, T).contiguous()
+            else:
+                expanded_time_mask = time_mask
+
         j = 0
         for i in range(len(self.time_blocks)):
             time_tokens = tokens.contiguous().view(B * N, T, -1)  # B N T C -> (B N) T C
 
-            time_tokens = self.time_blocks[i](time_tokens)
+            time_tokens = self.time_blocks[i](time_tokens, mask=expanded_time_mask)
 
             tokens = time_tokens.view(B, N, T, -1)  # (B N) T C -> B N T C
             if self.add_space_attn and (i % (len(self.time_blocks) // len(self.space_virtual_blocks)) == 0):
@@ -114,9 +138,9 @@ class EfficientUpdateFormer(nn.Module):
                 point_tokens = space_tokens[:, : N - self.num_virtual_tracks]
                 virtual_tokens = space_tokens[:, N - self.num_virtual_tracks :]
 
-                virtual_tokens = self.space_virtual2point_blocks[j](virtual_tokens, point_tokens, mask=mask)
+                virtual_tokens = self.space_virtual2point_blocks[j](virtual_tokens, point_tokens, mask=space_mask)
                 virtual_tokens = self.space_virtual_blocks[j](virtual_tokens)
-                point_tokens = self.space_point2virtual_blocks[j](point_tokens, virtual_tokens, mask=mask)
+                point_tokens = self.space_point2virtual_blocks[j](point_tokens, virtual_tokens, mask=space_mask)
 
                 space_tokens = torch.cat([point_tokens, virtual_tokens], dim=1)
                 tokens = space_tokens.view(B, T, N, -1).permute(0, 2, 1, 3)  # (B T) N C -> B N T C
