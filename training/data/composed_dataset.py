@@ -5,6 +5,8 @@
 # LICENSE file in the root directory of this source tree.
 
 from abc import ABC
+import os
+import re
 
 from hydra.utils import instantiate
 import torch
@@ -16,6 +18,79 @@ import bisect
 from .dataset_util import *
 from .track_util import *
 from .augmentation import get_image_augmentation
+
+
+def _parse_time_view_order(image_paths):
+    """Parse frame indices from filenames and return sorting order and metadata.
+
+    Filenames are expected to follow the pattern ``<prefix>_XXXXXX_camY.ext`` where
+    ``XXXXXX`` is a zero-padded timestamp and ``Y`` is the camera/view index. The
+    function sorts frames by ascending timestamp and then by ascending view index
+    within each timestamp. Missing views are simply ignored.
+
+    Args:
+        image_paths (list[str]): File paths for the frames in the current sample.
+
+    Returns:
+        tuple[list[int] | None, list[int] | None, list[int] | None]:
+            The permutation order to achieve the desired sorting, along with the
+            sorted time indices and view indices. ``None`` values are returned when
+            the paths are unavailable or cannot be parsed.
+    """
+
+    if not image_paths:
+        return None, None, None
+
+    pattern = re.compile(r"^(?P<prefix>.+?)_(?P<time>\d+)_cam(?P<view>\d+)\.[^.]+$")
+    parsed = []
+
+    for idx, path in enumerate(image_paths):
+        filename = os.path.basename(path)
+        match = pattern.match(filename)
+        if match is None:
+            return None, None, None
+        time_idx = int(match.group("time"))
+        view_idx = int(match.group("view"))
+        parsed.append((time_idx, view_idx, idx))
+
+    parsed.sort(key=lambda item: (item[0], item[1]))
+
+    order = [item[2] for item in parsed]
+    time_indices = [item[0] for item in parsed]
+    view_indices = [item[1] for item in parsed]
+    return order, time_indices, view_indices
+
+
+def _reorder_sequence_items(batch_dict, order):
+    """Apply a permutation along the sequence dimension for supported keys."""
+
+    if order is None:
+        return
+
+    sequence_keys = [
+        "images",
+        "depths",
+        "extrinsics",
+        "intrinsics",
+        "cam_points",
+        "world_points",
+        "point_masks",
+        "image_paths",
+        "tracks",
+        "track_masks",
+    ]
+
+    for key in sequence_keys:
+        if key not in batch_dict or batch_dict[key] is None:
+            continue
+        seq_value = batch_dict[key]
+        if isinstance(seq_value, list):
+            batch_dict[key] = [seq_value[i] for i in order]
+        else:
+            batch_dict[key] = seq_value[order]
+
+    if "ids" in batch_dict and batch_dict["ids"] is not None:
+        batch_dict["ids"] = batch_dict["ids"][order]
 
 
 class ComposedDataset(Dataset, ABC):
@@ -104,6 +179,13 @@ class ComposedDataset(Dataset, ABC):
         batch = self.base_dataset[idx_tuple]
         seq_name = batch["seq_name"]
 
+        order = None
+        time_indices = None
+        view_indices = None
+        if "image_paths" in batch:
+            order, time_indices, view_indices = _parse_time_view_order(batch["image_paths"])
+            _reorder_sequence_items(batch, order)
+
         # --- Data Conversion and Preparation ---
         # Convert numpy arrays to tensors
         images = torch.from_numpy(np.stack(batch["images"]).astype(np.float32)).contiguous()
@@ -143,6 +225,13 @@ class ComposedDataset(Dataset, ABC):
             "world_points": world_points,
             "point_masks": point_masks,
         }
+
+        if time_indices is not None and view_indices is not None:
+            sample["frame_time_indices"] = torch.as_tensor(time_indices, dtype=torch.long)
+            sample["frame_view_indices"] = torch.as_tensor(view_indices, dtype=torch.long)
+
+        if "image_paths" in batch:
+            sample["image_paths"] = batch["image_paths"]
 
         # --- Track Processing (if enabled) ---
         if self.load_track:

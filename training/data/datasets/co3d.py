@@ -276,5 +276,6 @@ class Co3dDataset(BaseDataset):
             "world_points": world_points,
             "point_masks": point_masks,
             "original_sizes": original_sizes,
+            "image_paths": image_paths,
         }
         return batch

@@ -152,6 +152,7 @@ class VKittiDataset(BaseDataset):
         extrinsics = []
         intrinsics = []
         original_sizes = []
+        image_paths = []
 
         for image_idx in ids:
             image_filepath = osp.join(self.VKitti_DIR, seq_name, f"rgb_{image_idx:05d}.jpg")
@@ -207,6 +208,7 @@ class VKittiDataset(BaseDataset):
             world_points.append(world_coords_points)
             point_masks.append(point_mask)
             original_sizes.append(original_size)
+            image_paths.append(image_filepath)
 
         set_name = "vkitti"
         batch = {
@@ -221,5 +223,6 @@ class VKittiDataset(BaseDataset):
             "world_points": world_points,
             "point_masks": point_masks,
             "original_sizes": original_sizes,
+            "image_paths": image_paths,
         }
         return batch

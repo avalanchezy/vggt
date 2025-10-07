@@ -220,6 +220,16 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
                 predictions["world_points"] = pts3d
                 predictions["world_points_conf"] = pts3d_conf
 
+        frame_names_for_tracker = None
+        if frame_names is not None:
+            if isinstance(frame_names, Sequence):
+                if len(frame_names) > 0 and isinstance(frame_names[0], str):
+                    frame_names_for_tracker = [list(frame_names)]
+                else:
+                    frame_names_for_tracker = [list(names) for names in frame_names]
+            else:
+                frame_names_for_tracker = frame_names
+
         if self.track_head is not None and query_points is not None:
             track_list, vis, conf = self.track_head(
                 aggregated_tokens_list,
