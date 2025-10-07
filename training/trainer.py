@@ -695,10 +695,17 @@ class Trainer:
         flipped version of itself.
         """
         tensor_keys = [
-            "images", "depths", "extrinsics", "intrinsics", 
-            "cam_points", "world_points", "point_masks", 
-        ]        
-        string_keys = ["seq_name"]
+            "images",
+            "depths",
+            "extrinsics",
+            "intrinsics",
+            "cam_points",
+            "world_points",
+            "point_masks",
+            "frame_time_indices",
+            "frame_view_indices",
+        ]
+        string_keys = ["seq_name", "image_paths"]
         
         for key in tensor_keys:
             if key in batch:
@@ -743,7 +750,12 @@ class Trainer:
             A dictionary containing the computed losses.
         """
         # Forward pass
-        y_hat = model(images=batch["images"])
+        y_hat = model(
+            images=batch["images"],
+            frame_time_indices=batch.get("frame_time_indices"),
+            frame_view_indices=batch.get("frame_view_indices"),
+            frame_names=batch.get("image_paths"),
+        )
         
         # Loss computation
         loss_dict = self.loss(y_hat, batch)

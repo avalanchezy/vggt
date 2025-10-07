@@ -4,6 +4,8 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
+from typing import List, Optional, Sequence, Union
+
 import torch
 import torch.nn as nn
 from huggingface_hub import PyTorchModelHubMixin  # used for model hub
@@ -26,7 +28,14 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
         self.depth_head = DPTHead(dim_in=2 * embed_dim, output_dim=2, activation="exp", conf_activation="expp1") if enable_depth else None
         self.track_head = TrackHead(dim_in=2 * embed_dim, patch_size=patch_size) if enable_track else None
 
-    def forward(self, images: torch.Tensor, query_points: torch.Tensor = None):
+    def forward(
+        self,
+        images: torch.Tensor,
+        query_points: Optional[torch.Tensor] = None,
+        frame_time_indices: Optional[torch.Tensor] = None,
+        frame_view_indices: Optional[torch.Tensor] = None,
+        frame_names: Optional[Union[Sequence[str], Sequence[Sequence[str]]]] = None,
+    ):
         """
         Forward pass of the VGGT model.
 
@@ -54,7 +63,13 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
         # If without batch dimension, add it
         if len(images.shape) == 4:
             images = images.unsqueeze(0)
-            
+            if frame_time_indices is not None and isinstance(frame_time_indices, torch.Tensor) and frame_time_indices.dim() == 1:
+                frame_time_indices = frame_time_indices.unsqueeze(0)
+            if frame_view_indices is not None and isinstance(frame_view_indices, torch.Tensor) and frame_view_indices.dim() == 1:
+                frame_view_indices = frame_view_indices.unsqueeze(0)
+            if frame_names is not None and isinstance(frame_names, (list, tuple)) and frame_names and isinstance(frame_names[0], str):
+                frame_names = [list(frame_names)]
+
         if query_points is not None and len(query_points.shape) == 2:
             query_points = query_points.unsqueeze(0)
 
@@ -82,9 +97,25 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
                 predictions["world_points"] = pts3d
                 predictions["world_points_conf"] = pts3d_conf
 
+        frame_names_for_tracker = None
+        if frame_names is not None:
+            if isinstance(frame_names, Sequence):
+                if len(frame_names) > 0 and isinstance(frame_names[0], str):
+                    frame_names_for_tracker = [list(frame_names)]
+                else:
+                    frame_names_for_tracker = [list(names) for names in frame_names]
+            else:
+                frame_names_for_tracker = frame_names
+
         if self.track_head is not None and query_points is not None:
             track_list, vis, conf = self.track_head(
-                aggregated_tokens_list, images=images, patch_start_idx=patch_start_idx, query_points=query_points
+                aggregated_tokens_list,
+                images=images,
+                patch_start_idx=patch_start_idx,
+                query_points=query_points,
+                frame_time_indices=frame_time_indices,
+                frame_view_indices=frame_view_indices,
+                frame_names=frame_names_for_tracker,
             )
             predictions["track"] = track_list[-1]  # track of the last iteration
             predictions["vis"] = vis
