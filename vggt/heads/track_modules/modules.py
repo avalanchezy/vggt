@@ -159,10 +159,11 @@ class AttnBlock(nn.Module):
         # Normalize before attention
         x = self.norm1(x)
 
-        # PyTorch's MultiheadAttention returns attn_output, attn_output_weights
-        # attn_output, _ = self.attn(x, x, x, attn_mask=attn_mask)
+        attn_kwargs = {}
+        if mask is not None:
+            attn_kwargs["attn_mask"] = mask
 
-        attn_output, _ = self.attn(x, x, x)
+        attn_output, _ = self.attn(x, x, x, **attn_kwargs)
 
         # Add & Norm
         x = x + attn_output
