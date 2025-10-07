@@ -126,6 +126,21 @@ class EfficientUpdateFormer(nn.Module):
             else:
                 expanded_time_mask = time_mask
 
+            if expanded_time_mask.dim() == 2:
+                expanded_time_mask = expanded_time_mask.unsqueeze(0)
+
+            expanded_time_mask = expanded_time_mask.to(tokens.device)
+
+            if expanded_time_mask.size(0) != B * N * self.num_heads:
+                expanded_time_mask = (
+                    expanded_time_mask.unsqueeze(1)
+                    .expand(-1, self.num_heads, -1, -1)
+                    .reshape(-1, T, T)
+                    .contiguous()
+                )
+            else:
+                expanded_time_mask = expanded_time_mask.contiguous()
+
         j = 0
         for i in range(len(self.time_blocks)):
             time_tokens = tokens.contiguous().view(B * N, T, -1)  # B N T C -> (B N) T C

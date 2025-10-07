@@ -18,7 +18,7 @@ from .utils import sample_features4d, get_2d_embedding, get_2d_sincos_pos_embed
 from .modules import Mlp
 
 
-def _to_batch_lists(
+def to_batch_lists(
     values: Optional[Sequence], batch_size: int
 ) -> Optional[List[List[int]]]:
     """Convert possible tensor/list inputs into per-batch Python lists."""
@@ -48,7 +48,7 @@ def _to_batch_lists(
     return None
 
 
-def _parse_names_to_indices(
+def parse_names_to_indices(
     frame_names: Sequence[Sequence[str]],
 ) -> Optional[Tuple[List[List[int]], List[List[int]]]]:
     """Parse timestamps and view indices from filename batches."""
@@ -73,7 +73,7 @@ def _parse_names_to_indices(
     return time_batches, view_batches
 
 
-def _build_time_view_mask(times: Sequence[int], views: Sequence[int]) -> torch.Tensor:
+def build_time_view_mask(times: Sequence[int], views: Sequence[int]) -> torch.Tensor:
     """Create a boolean attention mask enforcing adjacency constraints."""
 
     length = len(times)
@@ -121,7 +121,7 @@ def _build_time_view_mask(times: Sequence[int], views: Sequence[int]) -> torch.T
     return ~allowed
 
 
-def _build_batch_time_view_mask(
+def build_batch_time_view_mask(
     times: List[List[int]],
     views: List[List[int]],
     device: torch.device,
@@ -129,7 +129,7 @@ def _build_batch_time_view_mask(
     """Stack per-sample masks into a tensor of shape (B, S, S)."""
 
     masks = [
-        _build_time_view_mask(sample_times, sample_views)
+        build_time_view_mask(sample_times, sample_views)
         for sample_times, sample_views in zip(times, views)
     ]
     return torch.stack(masks, dim=0).to(device)
@@ -249,20 +249,20 @@ class BaseTrackerPredictor(nn.Module):
 
         fcorr_fn = CorrBlock(fmaps, num_levels=self.corr_levels, radius=self.corr_radius)
 
-        time_lists = _to_batch_lists(frame_time_indices, B)
-        view_lists = _to_batch_lists(frame_view_indices, B)
+        time_lists = to_batch_lists(frame_time_indices, B)
+        view_lists = to_batch_lists(frame_view_indices, B)
 
         if (time_lists is None or view_lists is None) and frame_names is not None:
             name_lists = frame_names
             if isinstance(name_lists, (list, tuple)) and name_lists and isinstance(name_lists[0], str):
                 name_lists = [name_lists]
-            parsed = _parse_names_to_indices(name_lists) if name_lists is not None else None
+            parsed = parse_names_to_indices(name_lists) if name_lists is not None else None
             if parsed is not None:
                 time_lists, view_lists = parsed
 
         time_attn_mask = None
         if time_lists is not None and view_lists is not None:
-            time_attn_mask = _build_batch_time_view_mask(time_lists, view_lists, device=query_points.device)
+            time_attn_mask = build_batch_time_view_mask(time_lists, view_lists, device=query_points.device)
 
         coord_preds = []
 
