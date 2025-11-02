@@ -4,19 +4,19 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
-import logging
+from pathlib import Path
+from typing import List, Optional, Tuple, Union
+
+import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
-from typing import Optional, Tuple, Union, List, Dict, Any
 
 from vggt.layers import PatchEmbed
 from vggt.layers.block import Block
 from vggt.layers.rope import RotaryPositionEmbedding2D, PositionGetter
 from vggt.layers.vision_transformer import vit_small, vit_base, vit_large, vit_giant2
 
-logger = logging.getLogger(__name__)
 
 _RESNET_MEAN = [0.485, 0.456, 0.406]
 _RESNET_STD = [0.229, 0.224, 0.225]
@@ -138,7 +138,22 @@ class Aggregator(nn.Module):
         for name, value in (("_resnet_mean", _RESNET_MEAN), ("_resnet_std", _RESNET_STD)):
             self.register_buffer(name, torch.FloatTensor(value).view(1, 1, 3, 1, 1), persistent=False)
 
-        self.use_reentrant = False # hardcoded to False
+        self.use_reentrant = False  # hardcoded to False
+        self.use_intra_timestep_suppression: bool = True
+        self.attention_mask_export_path: Optional[Path] = None
+        self.last_token_attention_mask: Optional[torch.Tensor] = None
+        self.last_frame_attention_mask: Optional[torch.Tensor] = None
+        self.token_export_threshold: int = 5
+
+    def set_attention_mask_export_path(self, path: Optional[Union[str, Path]]) -> None:
+        if path is None:
+            self.attention_mask_export_path = None
+            return
+        export_path = Path(path)
+        if export_path.suffix != ".csv":
+            export_path = export_path.with_suffix(".csv")
+        export_path.parent.mkdir(parents=True, exist_ok=True)
+        self.attention_mask_export_path = export_path
 
     def __build_patch_embed__(
         self,
@@ -181,11 +196,14 @@ class Aggregator(nn.Module):
             if hasattr(self.patch_embed, "mask_token"):
                 self.patch_embed.mask_token.requires_grad_(False)
 
-    def forward(self, images: torch.Tensor) -> Tuple[List[torch.Tensor], int]:
+    def forward(self, images: torch.Tensor, timesteps: Optional[torch.Tensor] = None) -> Tuple[List[torch.Tensor], int]:
         """
         Args:
             images (torch.Tensor): Input images with shape [B, S, 3, H, W], in range [0, 1].
                 B: batch size, S: sequence length, 3: RGB channels, H: height, W: width
+            timesteps (torch.Tensor, optional): Integer ids of shape [S] or [B, S] describing
+                which frames belong to the same timestep. If omitted, intra-timestep suppression
+                is skipped even when enabled.
 
         Returns:
             (list[torch.Tensor], int):
@@ -196,6 +214,16 @@ class Aggregator(nn.Module):
 
         if C_in != 3:
             raise ValueError(f"Expected 3 input channels, got {C_in}")
+
+        timestep_ids: Optional[torch.Tensor] = None
+        if timesteps is not None:
+            if timesteps.dim() == 1:
+                if B != 1:
+                    raise ValueError("1D timesteps tensor requires batch size 1.")
+                timesteps = timesteps.unsqueeze(0)
+            if timesteps.shape != (B, S):
+                raise ValueError(f"Expected timesteps shape {(B, S)}, got {tuple(timesteps.shape)}")
+            timestep_ids = timesteps.to(images.device, dtype=torch.int64)
 
         # Normalize images and reshape for patch embed
         images = (images - self._resnet_mean) / self._resnet_std
@@ -242,7 +270,7 @@ class Aggregator(nn.Module):
                     )
                 elif attn_type == "global":
                     tokens, global_idx, global_intermediates = self._process_global_attention(
-                        tokens, B, S, P, C, global_idx, pos=pos
+                        tokens, B, S, P, C, global_idx, pos=pos, timestep_ids=timestep_ids
                     )
                 else:
                     raise ValueError(f"Unknown attention type: {attn_type}")
@@ -281,7 +309,7 @@ class Aggregator(nn.Module):
 
         return tokens, frame_idx, intermediates
 
-    def _process_global_attention(self, tokens, B, S, P, C, global_idx, pos=None):
+    def _process_global_attention(self, tokens, B, S, P, C, global_idx, pos=None, timestep_ids=None):
         """
         Process global attention blocks. We keep tokens in shape (B, S*P, C).
         """
@@ -292,18 +320,110 @@ class Aggregator(nn.Module):
             pos = pos.view(B, S, P, 2).view(B, S * P, 2)
 
         intermediates = []
+        attn_mask = self._build_attention_mask(tokens, B, S, P, timestep_ids=timestep_ids)
 
         # by default, self.aa_block_size=1, which processes one block at a time
         for _ in range(self.aa_block_size):
             if self.training:
-                tokens = checkpoint(self.global_blocks[global_idx], tokens, pos, use_reentrant=self.use_reentrant)
+                tokens = checkpoint(
+                    self.global_blocks[global_idx], tokens, pos, attn_mask, use_reentrant=self.use_reentrant
+                )
             else:
-                tokens = self.global_blocks[global_idx](tokens, pos=pos)
+                tokens = self.global_blocks[global_idx](tokens, pos=pos, attn_mask=attn_mask)
             global_idx += 1
             intermediates.append(tokens.view(B, S, P, C))
 
         return tokens, global_idx, intermediates
 
+
+    def _build_attention_mask(
+        self,
+        tokens: torch.Tensor,
+        B: int,
+        S: int,
+        P: int,
+        timestep_ids: Optional[torch.Tensor],
+    ) -> Optional[torch.Tensor]:
+        base_mask: Optional[torch.Tensor] = None
+        store_token_mask = S <= self.token_export_threshold
+        token_mask: Optional[torch.Tensor] = (
+            torch.zeros((B, S * P, S * P), dtype=torch.bool, device=tokens.device) if store_token_mask else None
+        )
+        frame_mask = torch.zeros((B, S, S), dtype=torch.bool, device=tokens.device)
+
+        if self.use_intra_timestep_suppression and timestep_ids is not None:
+            B_ids, S_ids = timestep_ids.shape
+            if B_ids != B or S_ids != S:
+                raise ValueError(
+                    f"timestep ids shape {(B_ids, S_ids)} does not match expected {(B, S)}"
+                )
+
+            same_timestep = timestep_ids[:, :, None] == timestep_ids[:, None, :]
+            frame_idx = torch.arange(S_ids, device=timestep_ids.device)
+            different_frame = frame_idx.view(1, S_ids, 1) != frame_idx.view(1, 1, S_ids)
+            mask_frames = same_timestep & different_frame
+            frame_mask = mask_frames
+
+            if mask_frames.any():
+                mask_token = mask_frames.repeat_interleave(P, dim=1).repeat_interleave(P, dim=2)
+                if self.patch_start_idx > 0:
+                    token_offsets = torch.arange(P, device=timestep_ids.device)
+                    special = token_offsets < self.patch_start_idx
+                    if special.any():
+                        special_mask = special.repeat(S_ids)
+                        mask_token[:, special_mask, :] = False
+                        mask_token[:, :, special_mask] = False
+                if token_mask is not None:
+                    token_mask = mask_token
+                base_mask = mask_token.unsqueeze(1)
+
+        mask = base_mask
+        self.last_token_attention_mask = token_mask.detach().cpu() if token_mask is not None else None
+        self.last_frame_attention_mask = frame_mask.detach().cpu()
+        self._export_attention_mask()
+        return mask
+
+    def _export_attention_mask(self) -> None:
+        if self.attention_mask_export_path is None:
+            return
+
+        if self.last_token_attention_mask is not None:
+            data = self.last_token_attention_mask.to(dtype=torch.int8).numpy()
+            suffix = "token"
+        elif self.last_frame_attention_mask is not None:
+            data = self.last_frame_attention_mask.to(dtype=torch.int8).numpy()
+            suffix = "frame"
+        else:
+            return
+
+        target = self.attention_mask_export_path
+
+        if suffix == "token":
+            if target.exists():
+                target.unlink()
+            for label in {"frame", "token"}:
+                pattern = f"{target.stem}_{label}_b*{target.suffix}"
+                for existing in target.parent.glob(pattern):
+                    existing.unlink(missing_ok=True)
+            if data.shape[0] == 1:
+                np.savetxt(target, data[0], fmt="%d", delimiter=",")
+            else:
+                for idx, mat in enumerate(data):
+                    per_target = target.with_name(f"{target.stem}_{suffix}_b{idx}{target.suffix}")
+                    np.savetxt(per_target, mat, fmt="%d", delimiter=",")
+        else:
+            if target.exists():
+                target.unlink()
+            for label in {"frame", "token"}:
+                pattern = f"{target.stem}_{label}_b*{target.suffix}"
+                for existing in target.parent.glob(pattern):
+                    existing.unlink(missing_ok=True)
+            if data.shape[0] == 1:
+                np.savetxt(target, data[0], fmt="%d", delimiter=",")
+            else:
+                for idx, mat in enumerate(data):
+                    per_target = target.with_name(f"{target.stem}_{suffix}_b{idx}{target.suffix}")
+                    np.savetxt(per_target, mat, fmt="%d", delimiter=",")
 
 def slice_expand_and_flatten(token_tensor, B, S):
     """
