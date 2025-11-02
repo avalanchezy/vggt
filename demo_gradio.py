@@ -4,7 +4,9 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
+import argparse
 import os
+import re
 import cv2
 import torch
 import numpy as np
@@ -26,6 +28,15 @@ from vggt.utils.geometry import unproject_depth_map_to_point_map
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
+parser = argparse.ArgumentParser(description="VGGT Gradio demo controls")
+parser.add_argument(
+    "--use_intra_timestep_suppression",
+    action="store_true",
+    help="Disable intra-timestep attention in global layers",
+)
+args, unknown = parser.parse_known_args()
+sys.argv = [sys.argv[0]] + unknown
+
 print("Initializing and loading VGGT model...")
 # model = VGGT.from_pretrained("facebook/VGGT-1B")  # another way to load the model
 
@@ -36,6 +47,7 @@ model.load_state_dict(torch.hub.load_state_dict_from_url(_URL))
 
 model.eval()
 model = model.to(device)
+model.use_intra_timestep_suppression = args.use_intra_timestep_suppression
 
 
 # -------------------------------------------------------------------------
@@ -46,6 +58,7 @@ def run_model(target_dir, model) -> dict:
     Run the VGGT model on images in the 'target_dir/images' folder and return predictions.
     """
     print(f"Processing images from {target_dir}")
+    model.attention_mask_export_path = os.path.join(target_dir, "attention_mask.csv")
 
     # Device check
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -64,6 +77,15 @@ def run_model(target_dir, model) -> dict:
         raise ValueError("No images found. Check your upload.")
 
     images = load_and_preprocess_images(image_names).to(device)
+    timestep_pattern = re.compile(r"_([0-9]+)_cam")
+    timesteps = []
+    for idx, name in enumerate(image_names):
+        match = timestep_pattern.search(os.path.basename(name))
+        if match:
+            timesteps.append(int(match.group(1)))
+        else:
+            timesteps.append(idx)
+    timesteps_tensor = torch.tensor(timesteps, dtype=torch.int64, device=device)
     print(f"Preprocessed images shape: {images.shape}")
 
     # Run inference
@@ -72,7 +94,16 @@ def run_model(target_dir, model) -> dict:
 
     with torch.no_grad():
         with torch.cuda.amp.autocast(dtype=dtype):
-            predictions = model(images)
+            predictions = model(images, timesteps=timesteps_tensor)
+
+    mask_csv_path = os.path.join(target_dir, "attention_mask.csv")
+    if os.path.exists(mask_csv_path):
+        print(f"Attention mask CSV saved to {mask_csv_path}")
+    else:
+        pattern = os.path.join(target_dir, "attention_mask_*_b*.csv")
+        matches = sorted(glob.glob(pattern))
+        if matches:
+            print(f"Attention mask CSV files saved to: {', '.join(matches)}")
 
     # Convert pose encoding to extrinsic and intrinsic matrices
     print("Converting pose encoding to extrinsic and intrinsic matrices...")
