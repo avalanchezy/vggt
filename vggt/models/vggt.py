@@ -4,6 +4,9 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
+from pathlib import Path
+from typing import Optional
+
 import torch
 import torch.nn as nn
 from huggingface_hub import PyTorchModelHubMixin  # used for model hub
@@ -26,7 +29,14 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
         self.depth_head = DPTHead(dim_in=2 * embed_dim, output_dim=2, activation="exp", conf_activation="expp1") if enable_depth else None
         self.track_head = TrackHead(dim_in=2 * embed_dim, patch_size=patch_size) if enable_track else None
 
-    def forward(self, images: torch.Tensor, query_points: torch.Tensor = None):
+        self.use_intra_timestep_suppression = True
+
+    def forward(
+        self,
+        images: torch.Tensor,
+        query_points: torch.Tensor = None,
+        timesteps: torch.Tensor = None,
+    ):
         """
         Forward pass of the VGGT model.
 
@@ -36,6 +46,8 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
             query_points (torch.Tensor, optional): Query points for tracking, in pixel coordinates.
                 Shape: [N, 2] or [B, N, 2], where N is the number of query points.
                 Default: None
+            timesteps (torch.Tensor, optional): Integer timestep ids with shape [S] or [B, S].
+                Used to toggle intra-timestep suppression for global attention.
 
         Returns:
             dict: A dictionary containing the following predictions:
@@ -58,7 +70,7 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
         if query_points is not None and len(query_points.shape) == 2:
             query_points = query_points.unsqueeze(0)
 
-        aggregated_tokens_list, patch_start_idx = self.aggregator(images)
+        aggregated_tokens_list, patch_start_idx = self.aggregator(images, timesteps=timesteps)
 
         predictions = {}
 
@@ -94,4 +106,20 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
             predictions["images"] = images  # store the images for visualization during inference
 
         return predictions
+
+    @property
+    def use_intra_timestep_suppression(self) -> bool:
+        return getattr(self.aggregator, "use_intra_timestep_suppression", False)
+
+    @use_intra_timestep_suppression.setter
+    def use_intra_timestep_suppression(self, value: bool) -> None:
+        self.aggregator.use_intra_timestep_suppression = bool(value)
+
+    @property
+    def attention_mask_export_path(self) -> Optional[Path]:
+        return getattr(self.aggregator, "attention_mask_export_path", None)
+
+    @attention_mask_export_path.setter
+    def attention_mask_export_path(self, value) -> None:
+        self.aggregator.set_attention_mask_export_path(value)
 
